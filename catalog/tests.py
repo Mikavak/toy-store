@@ -1,10 +1,13 @@
 from datetime import timedelta
 from decimal import Decimal
 
+from django.contrib import admin
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
 from django.test import TestCase
+from django.urls import reverse
 from django.utils import timezone
 
 from .models import Category, Product
@@ -159,3 +162,160 @@ class ProductTests(TestCase):
         product.refresh_from_db()
         self.assertEqual(product.created_at, created_at)
         self.assertGreater(product.updated_at, earlier)
+
+
+class CatalogAdminTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin_user = get_user_model().objects.create_superuser(
+            username="admin", email="admin@example.com", password="test-password"
+        )
+        cls.builders = Category.objects.create(
+            name="Конструкторы", slug="builders"
+        )
+        cls.soft_toys = Category.objects.create(
+            name="Мягкие игрушки", slug="soft-toys"
+        )
+        cls.available_product = Product.objects.create(
+            name="Деревянный домик",
+            slug="wooden-house",
+            description="Набор деталей для сборки домика.",
+            price=Decimal("1299.90"),
+            category=cls.builders,
+            recommended_age="От 3 лет",
+        )
+        cls.unavailable_product = Product.objects.create(
+            name="Плюшевый медведь",
+            slug="plush-bear",
+            description="Мягкая игрушка для сна.",
+            price=Decimal("899.00"),
+            category=cls.soft_toys,
+            recommended_age="От 1 года",
+            is_available=False,
+        )
+
+    def setUp(self):
+        self.category_changelist_url = reverse("admin:catalog_category_changelist")
+        self.product_changelist_url = reverse("admin:catalog_product_changelist")
+
+    def test_models_are_registered(self):
+        self.assertIn(Category, admin.site._registry)
+        self.assertIn(Product, admin.site._registry)
+
+    def test_unauthenticated_user_is_redirected_to_login(self):
+        for url in (self.category_changelist_url, self.product_changelist_url):
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertRedirects(
+                    response,
+                    f"{reverse('admin:login')}?next={url}",
+                )
+
+    def test_admin_can_view_category_changelist_with_data(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.get(self.category_changelist_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.builders.name)
+        self.assertContains(response, self.builders.slug)
+        self.assertContains(response, self.soft_toys.name)
+
+    def test_admin_can_search_categories_by_name(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.get(self.category_changelist_url, {"q": "Конструкт"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.builders.name)
+        self.assertNotContains(response, self.soft_toys.name)
+
+    def test_admin_can_view_product_changelist_with_data(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.get(self.product_changelist_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.available_product.name)
+        self.assertContains(response, self.builders.name)
+        self.assertContains(response, self.available_product.price)
+        self.assertContains(response, self.available_product.recommended_age)
+
+    def test_admin_can_search_products_by_name_description_and_slug(self):
+        self.client.force_login(self.admin_user)
+
+        for query in ("Деревянный", "деталей", "wooden-house"):
+            with self.subTest(query=query):
+                response = self.client.get(self.product_changelist_url, {"q": query})
+                self.assertContains(response, self.available_product.name)
+                self.assertNotContains(response, self.unavailable_product.name)
+
+    def test_admin_can_filter_products_by_category_and_availability(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.get(
+            self.product_changelist_url,
+            {
+                "category__id__exact": self.soft_toys.pk,
+                "is_available__exact": "0",
+            },
+        )
+
+        self.assertContains(response, self.unavailable_product.name)
+        self.assertNotContains(response, self.available_product.name)
+
+    def test_admin_can_create_product(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.post(
+            reverse("admin:catalog_product_add"),
+            {
+                "name": "Набор кубиков",
+                "slug": "building-blocks",
+                "description": "Яркие кубики для первых построек.",
+                "price": "749.50",
+                "category": self.builders.pk,
+                "recommended_age": "От 2 лет",
+                "image": "",
+                "is_available": "on",
+                "_save": "Save",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        product = Product.objects.get(slug="building-blocks")
+        self.assertEqual(product.price, Decimal("749.50"))
+        self.assertEqual(product.category, self.builders)
+        self.assertTrue(product.is_available)
+
+    def test_admin_can_change_product_price_category_and_availability(self):
+        self.client.force_login(self.admin_user)
+
+        response = self.client.post(
+            reverse("admin:catalog_product_change", args=[self.available_product.pk]),
+            {
+                "name": self.available_product.name,
+                "slug": self.available_product.slug,
+                "description": self.available_product.description,
+                "price": "1499.00",
+                "category": self.soft_toys.pk,
+                "recommended_age": self.available_product.recommended_age,
+                "image": "",
+                "_save": "Save",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.available_product.refresh_from_db()
+        self.assertEqual(self.available_product.price, Decimal("1499.00"))
+        self.assertEqual(self.available_product.category, self.soft_toys)
+        self.assertFalse(self.available_product.is_available)
+
+    def test_admin_does_not_delete_category_with_products(self):
+        self.client.force_login(self.admin_user)
+        delete_url = reverse("admin:catalog_category_delete", args=[self.builders.pk])
+
+        response = self.client.post(delete_url, {"post": "yes"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(Category.objects.filter(pk=self.builders.pk).exists())
