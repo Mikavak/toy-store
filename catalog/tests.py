@@ -4,6 +4,7 @@ from decimal import Decimal
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
 from django.test import TestCase
@@ -11,6 +12,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from .models import Category, Product
+from .management.commands.seed_store import SEED_CATEGORIES, SEED_PRODUCTS
 
 
 class CategoryTests(TestCase):
@@ -319,3 +321,75 @@ class CatalogAdminTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(Category.objects.filter(pk=self.builders.pk).exists())
+
+
+class SeedStoreCommandTests(TestCase):
+    def test_seed_store_creates_categories_and_products(self):
+        call_command("seed_store")
+
+        category_slugs = [category["slug"] for category in SEED_CATEGORIES]
+        product_slugs = [product["slug"] for product in SEED_PRODUCTS]
+        self.assertEqual(
+            Category.objects.filter(slug__in=category_slugs).count(),
+            len(SEED_CATEGORIES),
+        )
+        self.assertEqual(
+            Product.objects.filter(slug__in=product_slugs).count(),
+            len(SEED_PRODUCTS),
+        )
+
+    def test_seed_store_assigns_products_to_categories_with_valid_prices(self):
+        call_command("seed_store")
+
+        seeded_products = Product.objects.filter(
+            slug__in=[product["slug"] for product in SEED_PRODUCTS]
+        ).select_related("category")
+        self.assertEqual(seeded_products.count(), len(SEED_PRODUCTS))
+        self.assertEqual(
+            {product.category.slug for product in seeded_products},
+            {category["slug"] for category in SEED_CATEGORIES},
+        )
+        products_by_slug = {product.slug: product for product in seeded_products}
+        for expected_product in SEED_PRODUCTS:
+            with self.subTest(product=expected_product["slug"]):
+                product = products_by_slug[expected_product["slug"]]
+                self.assertEqual(product.price, expected_product["price"])
+                self.assertEqual(
+                    product.category.slug, expected_product["category_slug"]
+                )
+        for category in SEED_CATEGORIES:
+            with self.subTest(category=category["slug"]):
+                self.assertEqual(
+                    seeded_products.filter(category__slug=category["slug"]).count(), 3
+                )
+
+    def test_seed_store_is_idempotent(self):
+        call_command("seed_store")
+        category_count = Category.objects.count()
+        product_count = Product.objects.count()
+
+        call_command("seed_store")
+
+        self.assertEqual(Category.objects.count(), category_count)
+        self.assertEqual(Product.objects.count(), product_count)
+
+    def test_seed_store_preserves_existing_user_products(self):
+        user_category = Category.objects.create(
+            name="Пользовательская категория", slug="user-category"
+        )
+        user_product = Product.objects.create(
+            name="Пользовательский товар",
+            slug="user-product",
+            description="Товар, созданный до запуска команды.",
+            price=Decimal("123.45"),
+            category=user_category,
+            recommended_age="От 7 лет",
+            is_available=False,
+        )
+
+        call_command("seed_store")
+
+        user_product.refresh_from_db()
+        self.assertEqual(user_product.category, user_category)
+        self.assertEqual(user_product.price, Decimal("123.45"))
+        self.assertFalse(user_product.is_available)
